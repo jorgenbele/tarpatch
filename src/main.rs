@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use tokio::fs;
-use std::io::Read;
+
+
 use std::io::copy;
 
 use serde::{Deserialize, Serialize};
@@ -9,11 +9,12 @@ use std::path::{PathBuf, Path};
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, Context};
+use anyhow::bail;
 
-use filetime::FileTime;
+
 
 use tar::{Archive, Builder, Header};
-use flate2::read::GzDecoder;
+
 
 use sha1::{Sha1, Digest};
 
@@ -54,7 +55,7 @@ pub struct DiffMetadata {
     removed: Vec<PathBuf>,
 }
 
-fn open_tar(path: &Path, gzip: bool) -> Result<Archive<std::fs::File>> {
+fn open_tar(path: &Path, _gzip: bool) -> Result<Archive<std::fs::File>> {
     let file = std::fs::File::open(path)?;
     Ok(Archive::new(file))
 
@@ -71,20 +72,20 @@ pub struct IndexValue {
     cksum: u32,
 }
 
-const DELTA_METADATA_FILE: &'static str = "__delta_metadata.json";
+const DELTA_METADATA_FILE: &str = "__delta_metadata.json";
 
 async fn create_index(archive: &mut Archive<std::fs::File>) -> Result<HashMap<PathBuf, IndexValue>> {
     let mut index = HashMap::new();
-    let mut entries = archive.entries()?;
+    let entries = archive.entries()?;
     for entry in entries {
-        match entry.with_context(|| format!("corrupt tar")) {
+        match entry.with_context(|| "corrupt tar".to_string()) {
             Ok(mut entry) => {
                 let path = entry.path()?.to_path_buf();
-                let cksum = entry.header().cksum().with_context(|| format!("invalid cksum"))?;
+                let cksum = entry.header().cksum().with_context(|| "invalid cksum".to_string())?;
 
                 // create a Sha1 object
                 let mut hasher = Sha1::new();
-                copy(&mut entry, &mut hasher).with_context(|| format!("sha1 hashing failed"))?;
+                copy(&mut entry, &mut hasher).with_context(|| "sha1 hashing failed".to_string())?;
                 let sha1 = hasher.finalize();
                 let value = IndexValue { cksum, sha1: sha1.into() };
                 index.insert(path, value);
@@ -103,7 +104,7 @@ fn entry_has_changed(a: &IndexValue, b: &IndexValue) -> bool {
     a != b
 }
 
-async fn create_delta_archive(changed: HashSet<PathBuf>, mut new_tar: &Path,  metadata: &DiffMetadata, out: &Path) -> Result<()> {
+async fn create_delta_archive(changed: HashSet<PathBuf>, new_tar: &Path,  metadata: &DiffMetadata, out: &Path) -> Result<()> {
     // We now create a new tar file that consists of
     // a metadata file and the other files.
     // It will be structured like this:
@@ -111,32 +112,31 @@ async fn create_delta_archive(changed: HashSet<PathBuf>, mut new_tar: &Path,  me
     // __delta_metadata.json: the json file
 
     // TODO: this can be done in parallel
-    let mut file = std::fs::File::create(out)?;
+    let file = std::fs::File::create(out)?;
     let mut builder = Builder::new(file);
 
-    let mut new_tar = open_tar(new_tar, false)?;
-
-    let mut entries = new_tar.entries_with_seek()?;
-    for result_entry in entries {
-        let mut entry = result_entry.with_context(|| format!("corrupt tar"))?;
-
-        let mut path = entry.path()?.to_path_buf();
-        if changed.contains(&path) {
-            let mut header = entry.header().clone();
-            builder.append_data(&mut header, path, &mut entry);
-        }
-    }
-
-    // Write the metadata file to the tar archive
+    // Write the metadata file to the tar archive AS FIRST FILE
     let metadata_path = PathBuf::from(DELTA_METADATA_FILE);
     let mut metadata_header = Header::new_old();
 
     let mut metadata_bytes: Vec<u8> = Vec::new();
     serde_json::to_writer(&mut metadata_bytes, &metadata).unwrap();
     metadata_header.set_size(metadata_bytes.len() as u64);
-    builder.append_data(&mut metadata_header, metadata_path, &metadata_bytes[..]);
+    builder.append_data(&mut metadata_header, metadata_path, &metadata_bytes[..]).with_context(|| "unable to add metadata".to_string())?;
 
-    Ok(())
+    let mut new_tar = open_tar(new_tar, false)?;
+
+    let entries = new_tar.entries_with_seek()?;
+    for result_entry in entries {
+        let mut entry = result_entry.with_context(|| "corrupt tar".to_string())?;
+
+        let path = entry.path()?.to_path_buf();
+        if changed.contains(&path) {
+            let mut header = entry.header().clone();
+            builder.append_data(&mut header, path, &mut entry).with_context(|| "unable to add file".to_string())?;
+        }
+    }
+    builder.finish().with_context(|| "failed to create delta archive".to_string())
 }
 
 async fn diff(old: &Path, new: &Path, gzip: bool, out: &Path) -> Result<()> {
@@ -195,7 +195,68 @@ async fn diff(old: &Path, new: &Path, gzip: bool, out: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn apply(old: &Path, diff: &Path) -> Result<()> {
+async fn apply_delta_archive(old: &Path, diff: &Path, out: &Path) -> Result<()> {
+    let file = std::fs::File::create(out)?;
+    let mut builder = Builder::new(file);
+
+
+    let mut diff_tar = open_tar(diff, false)?;
+    let mut entries = diff_tar.entries_with_seek()?;
+
+    // read the metadata entry (should be first entry)
+    let metadata: DiffMetadata = {
+        let first = entries.next();
+        if first.is_none() {
+            bail!("empty delta file");
+        }
+        let mut entry = first.unwrap().with_context(|| "corrupt tar missing metadata".to_string())?;
+        let path = entry.path()?.to_path_buf();
+        if path != PathBuf::from(DELTA_METADATA_FILE) {
+            bail!("delta file is missing metadata file as first entry");
+        }
+        serde_json::from_reader(&mut entry).with_context(|| "invalid metadata file".to_string())?
+    };
+
+    let changed: HashSet<&PathBuf> = HashSet::from_iter(metadata.changed.iter());
+    let added: HashSet<&PathBuf> = HashSet::from_iter(metadata.added.iter());
+    let removed: HashSet<&PathBuf> = HashSet::from_iter(metadata.removed.iter());
+
+    // add old entries
+    println!("Adding old entries..");
+    let mut old_tar = open_tar(old, false)?;
+    let old_entries = old_tar.entries_with_seek()?;
+    for result_entry in old_entries {
+        let mut entry = result_entry.with_context(|| "corrupt tar".to_string())?;
+
+        let path = entry.path()?.to_path_buf();
+        if !removed.contains(&path) && !changed.contains(&path) {
+            let mut header = entry.header().clone();
+            builder.append_data(&mut header, path, &mut entry).with_context(|| "unable to add old entry".to_string())?;
+        }
+    }
+
+    // apply diff
+    println!("Applying diff..");
+    for result_entry in entries {
+        let mut entry = result_entry.with_context(|| "corrupt tar".to_string())?;
+
+        let path = entry.path()?.to_path_buf();
+        if changed.contains(&path) || added.contains(&path) {
+            let mut header = entry.header().clone();
+            builder.append_data(&mut header, path, &mut entry).with_context(|| "unable to add diff change".to_string())?;
+        }
+    }
+
+    builder.finish().with_context(|| "failed to apply delta archive".to_string())?;
+
+    dbg!(&metadata);
+
+    Ok(())
+}
+
+async fn apply(old: &Path, diff: &Path, out: &Path) -> Result<()> {
+    apply_delta_archive(old, diff, out).await?;
+
     Ok(())
 }
 
@@ -205,8 +266,8 @@ async fn main() -> Result<()> {
     dbg!(&args);
 
     match &args.command {
-        Commands::Diff { old, new } => diff(&old, &new, args.gzip, &args.out).await?,
-        Commands::Apply { old, diff } => apply(&old, &diff).await?,
+        Commands::Diff { old, new } => diff(old, new, args.gzip, &args.out).await?,
+        Commands::Apply { old, diff } => apply(old, diff, &args.out).await?,
     }
     Ok(())
 }
