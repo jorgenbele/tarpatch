@@ -29,10 +29,6 @@ struct Args {
     #[arg(short = 'c', long, default_value_t = false)]
     gzip: bool,
 
-    // Output file
-    #[arg(short, long)]
-    out: PathBuf,
-
     // The command to execute
     #[command(subcommand)]
     command: Commands,
@@ -42,10 +38,10 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Creates a diff tar file containing the changed files
-    Diff { old: PathBuf, new: PathBuf },
+    Diff { old: PathBuf, new: PathBuf, out: PathBuf },
 
     /// Applies the diff tar file to an existing tar file
-    Apply { old: PathBuf, diff: PathBuf },
+    Apply { old: PathBuf, diff: PathBuf, out: PathBuf },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,8 +262,8 @@ async fn main() -> Result<()> {
     dbg!(&args);
 
     match &args.command {
-        Commands::Diff { old, new } => diff(old, new, args.gzip, &args.out).await?,
-        Commands::Apply { old, diff } => apply(old, diff, &args.out).await?,
+        Commands::Diff { old, new, out } => diff(old, new, args.gzip, &out).await?,
+        Commands::Apply { old, diff, out } => apply(old, diff, &out).await?,
     }
     Ok(())
 }
